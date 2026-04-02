@@ -1,12 +1,38 @@
 {
   "name": "markdown-notebook",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
+  "main": "electron/main.cjs",
+  "build": {
+    "appId": "com.scold301.markdownnotebook",
+    "productName": "Markdown Notebook",
+    "directories": {
+      "buildResources": "build",
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "package.json"
+    ],
+    "win": {
+      "icon": "build/icon.png",
+      "target": "nsis"
+    },
+    "mac": {
+      "icon": "build/icon.png"
+    },
+    "linux": {
+      "icon": "build/icon.png"
+    }
+  },
   "scripts": {
-    "dev": "vite",
+    "start": "electron .",
+    "dev": "npm run build:web && electron .",
+    "build:web": "tsc && vite build",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "build:app": "npm run build:web && electron-builder"
   },
   "dependencies": {
     "react": "^18.2.0",
@@ -18,7 +44,8 @@
     "tailwind-merge": "^2.2.1",
     "jspdf": "^2.5.1",
     "html2canvas": "^1.4.1",
-    "file-saver": "^2.0.5"
+    "file-saver": "^2.0.5",
+    "mermaid": "^10.9.1"
   },
   "devDependencies": {
     "@types/react": "^18.2.64",
@@ -30,6 +57,8 @@
     "postcss": "^8.4.35",
     "tailwindcss": "^3.4.1",
     "typescript": "^5.2.2",
-    "vite": "^5.1.6"
+    "vite": "^5.1.6",
+    "electron": "^35.0.0",
+    "electron-builder": "^26.0.12"
   }
 }
