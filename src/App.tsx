@@ -1,3 +1,16 @@
+/**
+ * Markdown Notebook 主应用组件
+ * 
+ * 功能概述：
+ * 1. 文件树管理：浏览、创建、删除文件和文件夹
+ * 2. 标签页管理：多文件编辑，支持重命名
+ * 3. Markdown 编辑器：实时编辑，支持拖拽图片
+ * 4. Markdown 预览：支持 GFM、Mermaid 图表
+ * 5. 导出功能：导出为 PDF、Word
+ * 6. 会话管理：自动保存和恢复会话状态
+ * 7. 撤销/重做：编辑历史管理
+ */
+
 import { useState, useEffect, useRef, isValidElement } from 'react'
 import { 
   FileText, Trash2, Eye, Edit3, 
@@ -13,13 +26,21 @@ import jsPDF from 'jspdf'
 import html2canvas from 'html2canvas'
 import { saveAs } from 'file-saver'
 import mermaid from 'mermaid'
-import { IMAGE_EXTENSIONS } from './lib/constants'
+import { IMAGE_EXTENSIONS, DEFAULT_AUTOSAVE_MINUTES } from './lib/constants'
 import { isProbablyExternalUrl, normalizePath } from './lib/path'
 
+/**
+ * 合并 Tailwind CSS 类名
+ * 使用 clsx 处理条件类名，使用 tailwind-merge 合并冲突的类名
+ */
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+/**
+ * 文件树节点类型
+ * @deprecated 使用 types/index.ts 中的 FileItem
+ */
 interface FileItem {
   name: string
   kind: 'file' | 'directory'
@@ -27,6 +48,10 @@ interface FileItem {
   children?: FileItem[]
 }
 
+/**
+ * 打开的标签页类型
+ * @deprecated 使用 types/index.ts 中的 OpenTab
+ */
 interface OpenTab {
   id: string
   name: string
@@ -40,9 +65,22 @@ interface OpenTab {
 }
 
 function App() {
+  // ==================== 状态管理 ====================
+  
+  /** 当前打开的根目录路径 */
   const [rootPath, setRootPath] = useState<string | null>(null)
+  
+  /** 文件树结构 */
   const [fileTree, setFileTree] = useState<FileItem[]>([])
+  
+  /** 展开的文件夹集合 */
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set())
+  
+  /**
+   * 创建未命名标签页
+   * @param n 标签页编号
+   * @returns 新的标签页对象
+   */
   const createUntitledTab = (n: number): OpenTab => ({
     id: `untitled-${n}`,
     name: `新文件${n}.md`,
@@ -52,47 +90,66 @@ function App() {
     isNew: true,
   })
 
+  /** 打开的标签页列表 */
   const [openTabs, setOpenTabs] = useState<OpenTab[]>(() => [createUntitledTab(1)])
+  
+  /** 当前激活的标签页 ID */
   const [activeTabId, setActiveTabId] = useState<string | null>(() => 'untitled-1')
+  
+  /** 视图模式：编辑、预览、分屏 */
   const [viewMode, setViewMode] = useState<'edit' | 'preview' | 'split'>('split')
+  
+  /** 保存状态 */
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  
+  /** 关于对话框是否打开 */
   const [aboutOpen, setAboutOpen] = useState(false)
+  
+  /** 正在重命名的标签页 ID */
   const [renamingTabId, setRenamingTabId] = useState<string | null>(null)
+  
+  /** 重命名输入框的值 */
   const [renameValue, setRenameValue] = useState('')
+  
+  /** 自动保存时间间隔（分钟） */
   const [autoSaveMinutes, setAutoSaveMinutes] = useState<number>(() => {
     const saved = localStorage.getItem('autoSaveMinutes')
-    const parsed = saved ? Number(saved) : 5
-    return Number.isFinite(parsed) ? parsed : 5
+    const parsed = saved ? Number(saved) : DEFAULT_AUTOSAVE_MINUTES
+    return Number.isFinite(parsed) ? parsed : DEFAULT_AUTOSAVE_MINUTES
   })
+  
+  /** 图片 src 缓存，避免重复读取文件 */
   const [imageSrcCache, setImageSrcCache] = useState<Record<string, string>>({})
+  
+  /** 预览区域 ref */
   const previewRef = useRef<HTMLDivElement>(null)
+  
+  /** 自动保存定时器 ref */
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  
+  /** 编辑器 textarea ref */
   const editorRef = useRef<HTMLTextAreaElement | null>(null)
+  
+  /** 下一个未命名标签页的编号 */
   const nextUntitledNumberRef = useRef(2)
+  
+  /** 撤销/重做历史记录 */
   const historyRef = useRef<Record<string, { past: string[]; future: string[] }>>({})
+  
+  /** 历史记录限制 */
   const HISTORY_LIMIT = 200
 
   const activeTab = openTabs.find(t => t.id === activeTabId)
 
-  useEffect(() => {
-    localStorage.setItem('autoSaveMinutes', String(autoSaveMinutes))
-  }, [autoSaveMinutes])
-
-  useEffect(() => {
-    let max = 0
-    for (const tab of openTabs) {
-      const m = /^untitled-(\d+)$/.exec(tab.id)
-      if (!m) continue
-      const n = Number(m[1])
-      if (Number.isFinite(n) && n > max) max = n
-    }
-    const next = max + 1
-    if (next > nextUntitledNumberRef.current) nextUntitledNumberRef.current = next
-  }, [openTabs])
-
+  // ==================== 会话管理 ====================
+  
   const SESSION_KEY = 'mdnb.session.v1'
   const sessionReadyRef = useRef(false)
 
+  /**
+   * 恢复会话状态
+   * 从 localStorage 中恢复上次关闭时的状态
+   */
   useEffect(() => {
     const restore = async () => {
       try {
@@ -216,6 +273,12 @@ function App() {
     persist()
   }, [rootPath, openTabs, activeTabId, viewMode])
 
+  // ==================== 文件操作 ====================
+  
+  /**
+   * 刷新文件树
+   * 重新从磁盘读取文件树结构
+   */
   const refreshFileTree = async () => {
     const desktop = (window as any).desktop
     if (!rootPath || !desktop?.listTree) return
@@ -223,6 +286,10 @@ function App() {
     setFileTree(tree)
   }
 
+  /**
+   * 打开文件夹
+   * 显示文件夹选择对话框，并加载文件树
+   */
   const openFolder = async () => {
     try {
       setImageSrcCache({})
@@ -328,6 +395,13 @@ function App() {
     }
   }
 
+  // ==================== 标签页操作 ====================
+  
+  /**
+   * 关闭标签页
+   * @param id 标签页 ID
+   * @param e 鼠标事件
+   */
   const closeTab = (id: string, e: React.MouseEvent) => {
     e.stopPropagation()
     const tabToClose = openTabs.find(t => t.id === id)
@@ -413,6 +487,13 @@ function App() {
     setActiveTabId(tab.id)
   }
 
+  // ==================== 编辑器操作 ====================
+  
+  /**
+   * 更新当前标签页的内容
+   * @param content 新内容
+   * @param options 选项，recordHistory 是否记录历史
+   */
   const updateActiveContent = (content: string, options?: { recordHistory?: boolean }) => {
     if (!activeTabId || activeTab?.type !== 'markdown') return
     const recordHistory = options?.recordHistory !== false
@@ -776,6 +857,12 @@ function App() {
     })
   }
 
+  // ==================== 导出功能 ====================
+  
+  /**
+   * 导出为 PDF
+   * 使用 html2canvas 将预览区域转换为图片，然后生成 PDF
+   */
   const exportPDF = async () => {
     if (!activeTab || activeTab.type !== 'markdown') return
     let restoreView = () => {}
@@ -837,6 +924,10 @@ function App() {
     }
   }
 
+  /**
+   * 导出为 Word
+   * 将预览区域的 HTML 包装为 Word 文档
+   */
   const exportWord = () => {
     if (!activeTab || activeTab.type !== 'markdown') return
     const content = `<html><body>${previewRef.current?.innerHTML || ''}</body></html>`
@@ -844,6 +935,10 @@ function App() {
     saveAs(blob, `${activeTab.name}.doc`)
   }
 
+  /**
+   * Mermaid 图表渲染组件
+   * 用于在 Markdown 中渲染 Mermaid 流程图、时序图等
+   */
   function MermaidDiagram({ chart }: { chart: string }) {
     const idRef = useRef(`m-${Math.random().toString(36).slice(2)}`)
     const containerRef = useRef<HTMLDivElement | null>(null)
@@ -909,6 +1004,11 @@ function App() {
     )
   }
 
+  /**
+   * Markdown 图片解析组件
+   * 用于解析 Markdown 中的图片路径，支持相对路径和外部 URL
+   * 会自动将相对路径转换为 Data URL
+   */
   function ResolvedMarkdownImage(props: any) {
     const src = String(props.src || '')
     const alt = props.alt
