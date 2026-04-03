@@ -1,3 +1,5 @@
 export { useHistory } from './useHistory'
 export { useAutoSave } from './useAutoSave'
 export { useSession } from './useSession'
+export { ThemeProvider, useTheme, type Theme } from './useTheme'
+export { default as useKeyboardShortcuts, type KeyboardShortcut } from './useKeyboardShortcuts'

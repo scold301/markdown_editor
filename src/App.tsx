@@ -5,21 +5,26 @@
  * 1. 文件树管理：浏览、创建、删除文件和文件夹
  * 2. 标签页管理：多文件编辑，支持重命名
  * 3. Markdown 编辑器：实时编辑，支持拖拽图片
- * 4. Markdown 预览：支持 GFM、Mermaid 图表
+ * 4. Markdown 预览：支持 GFM、Mermaid 图表、代码高亮、数学公式
  * 5. 导出功能：导出为 PDF、Word
  * 6. 会话管理：自动保存和恢复会话状态
  * 7. 撤销/重做：编辑历史管理
+ * 8. 主题切换：支持亮色/暗色主题
+ * 9. 文件搜索：快速搜索文件
+ * 10. 快捷键：丰富的快捷键支持
  */
 
-import { useState, useEffect, useRef, isValidElement } from 'react'
+import { useState, useEffect, useRef, isValidElement, useMemo, useCallback } from 'react'
 import { 
-  FileText, Trash2, Eye, Edit3, 
-  FolderOpen, ChevronRight, ChevronDown, X, 
-  Clock, CheckCircle, AlertCircle, File, FolderPlus, FilePlus, Image as ImageIcon,
-  Upload
+  FileText, Eye, Edit3, 
+  FolderOpen, X, 
+  Clock, CheckCircle, AlertCircle, FolderPlus, FilePlus, Image as ImageIcon,
+  Upload, Sun, Moon, Search
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkMath from 'remark-math'
+import rehypeKatex from 'rehype-katex'
 import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
 import jsPDF from 'jspdf'
@@ -28,19 +33,13 @@ import { saveAs } from 'file-saver'
 import mermaid from 'mermaid'
 import { IMAGE_EXTENSIONS, DEFAULT_AUTOSAVE_MINUTES } from './lib/constants'
 import { isProbablyExternalUrl, normalizePath } from './lib/path'
+import { useTheme, useKeyboardShortcuts, type KeyboardShortcut } from './hooks'
+import { FileSearch, VirtualizedFileTree } from './components'
 
-/**
- * 合并 Tailwind CSS 类名
- * 使用 clsx 处理条件类名，使用 tailwind-merge 合并冲突的类名
- */
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
-/**
- * 文件树节点类型
- * @deprecated 使用 types/index.ts 中的 FileItem
- */
 interface FileItem {
   name: string
   kind: 'file' | 'directory'
@@ -48,10 +47,6 @@ interface FileItem {
   children?: FileItem[]
 }
 
-/**
- * 打开的标签页类型
- * @deprecated 使用 types/index.ts 中的 OpenTab
- */
 interface OpenTab {
   id: string
   name: string
@@ -65,22 +60,12 @@ interface OpenTab {
 }
 
 function App() {
-  // ==================== 状态管理 ====================
+  const { theme, toggleTheme } = useTheme()
   
-  /** 当前打开的根目录路径 */
   const [rootPath, setRootPath] = useState<string | null>(null)
-  
-  /** 文件树结构 */
   const [fileTree, setFileTree] = useState<FileItem[]>([])
-  
-  /** 展开的文件夹集合 */
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set())
   
-  /**
-   * 创建未命名标签页
-   * @param n 标签页编号
-   * @returns 新的标签页对象
-   */
   const createUntitledTab = (n: number): OpenTab => ({
     id: `untitled-${n}`,
     name: `新文件${n}.md`,
@@ -90,66 +75,33 @@ function App() {
     isNew: true,
   })
 
-  /** 打开的标签页列表 */
   const [openTabs, setOpenTabs] = useState<OpenTab[]>(() => [createUntitledTab(1)])
-  
-  /** 当前激活的标签页 ID */
   const [activeTabId, setActiveTabId] = useState<string | null>(() => 'untitled-1')
-  
-  /** 视图模式：编辑、预览、分屏 */
   const [viewMode, setViewMode] = useState<'edit' | 'preview' | 'split'>('split')
-  
-  /** 保存状态 */
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
-  
-  /** 关于对话框是否打开 */
   const [aboutOpen, setAboutOpen] = useState(false)
-  
-  /** 正在重命名的标签页 ID */
   const [renamingTabId, setRenamingTabId] = useState<string | null>(null)
-  
-  /** 重命名输入框的值 */
   const [renameValue, setRenameValue] = useState('')
-  
-  /** 自动保存时间间隔（分钟） */
   const [autoSaveMinutes, setAutoSaveMinutes] = useState<number>(() => {
     const saved = localStorage.getItem('autoSaveMinutes')
     const parsed = saved ? Number(saved) : DEFAULT_AUTOSAVE_MINUTES
     return Number.isFinite(parsed) ? parsed : DEFAULT_AUTOSAVE_MINUTES
   })
-  
-  /** 图片 src 缓存，避免重复读取文件 */
   const [imageSrcCache, setImageSrcCache] = useState<Record<string, string>>({})
+  const [searchOpen, setSearchOpen] = useState(false)
   
-  /** 预览区域 ref */
   const previewRef = useRef<HTMLDivElement>(null)
-  
-  /** 自动保存定时器 ref */
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  
-  /** 编辑器 textarea ref */
   const editorRef = useRef<HTMLTextAreaElement | null>(null)
-  
-  /** 下一个未命名标签页的编号 */
   const nextUntitledNumberRef = useRef(2)
-  
-  /** 撤销/重做历史记录 */
   const historyRef = useRef<Record<string, { past: string[]; future: string[] }>>({})
-  
-  /** 历史记录限制 */
   const HISTORY_LIMIT = 200
 
   const activeTab = openTabs.find(t => t.id === activeTabId)
 
-  // ==================== 会话管理 ====================
-  
   const SESSION_KEY = 'mdnb.session.v1'
   const sessionReadyRef = useRef(false)
 
-  /**
-   * 恢复会话状态
-   * 从 localStorage 中恢复上次关闭时的状态
-   */
   useEffect(() => {
     const restore = async () => {
       try {
@@ -273,12 +225,6 @@ function App() {
     persist()
   }, [rootPath, openTabs, activeTabId, viewMode])
 
-  // ==================== 文件操作 ====================
-  
-  /**
-   * 刷新文件树
-   * 重新从磁盘读取文件树结构
-   */
   const refreshFileTree = async () => {
     const desktop = (window as any).desktop
     if (!rootPath || !desktop?.listTree) return
@@ -286,10 +232,6 @@ function App() {
     setFileTree(tree)
   }
 
-  /**
-   * 打开文件夹
-   * 显示文件夹选择对话框，并加载文件树
-   */
   const openFolder = async () => {
     try {
       setImageSrcCache({})
@@ -361,7 +303,7 @@ function App() {
 
   const createNewFile = async (parentPath = '') => {
     try {
-      const fileName = prompt('Enter file name (e.g., new_note.md):', 'new_note.md')
+      const fileName = prompt('输入文件名（例如：new_note.md）:', 'new_note.md')
       if (!fileName) return
       const normalizedName = fileName.includes('.') ? fileName : `${fileName}.md`
 
@@ -380,7 +322,7 @@ function App() {
 
   const createNewFolder = async (parentPath = '') => {
     try {
-      const folderName = prompt('Enter folder name:')
+      const folderName = prompt('输入文件夹名称:')
       if (!folderName) return
 
       const desktop = (window as any).desktop
@@ -395,13 +337,6 @@ function App() {
     }
   }
 
-  // ==================== 标签页操作 ====================
-  
-  /**
-   * 关闭标签页
-   * @param id 标签页 ID
-   * @param e 鼠标事件
-   */
   const closeTab = (id: string, e: React.MouseEvent) => {
     e.stopPropagation()
     const tabToClose = openTabs.find(t => t.id === id)
@@ -487,13 +422,6 @@ function App() {
     setActiveTabId(tab.id)
   }
 
-  // ==================== 编辑器操作 ====================
-  
-  /**
-   * 更新当前标签页的内容
-   * @param content 新内容
-   * @param options 选项，recordHistory 是否记录历史
-   */
   const updateActiveContent = (content: string, options?: { recordHistory?: boolean }) => {
     if (!activeTabId || activeTab?.type !== 'markdown') return
     const recordHistory = options?.recordHistory !== false
@@ -700,32 +628,18 @@ function App() {
     }
   }
 
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (renamingTabId) return
-      const isUndo = (e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'z' || e.key === 'Z')
-      const isRedo =
-        (e.ctrlKey || e.metaKey) &&
-        ((e.key === 'y' || e.key === 'Y') || (e.shiftKey && (e.key === 'z' || e.key === 'Z')))
+  const shortcuts: KeyboardShortcut[] = useMemo(() => [
+    { key: 's', ctrl: true, action: saveActiveFile, description: '保存' },
+    { key: 'z', ctrl: true, action: undoActive, description: '撤销' },
+    { key: 'y', ctrl: true, action: redoActive, description: '重做' },
+    { key: 'z', ctrl: true, shift: true, action: redoActive, description: '重做' },
+    { key: 'p', ctrl: true, action: () => setSearchOpen(true), description: '搜索文件' },
+    { key: 'n', ctrl: true, action: addNewTab, description: '新建标签页' },
+    { key: 'w', ctrl: true, action: () => activeTabId && closeTab(activeTabId, {} as any), description: '关闭当前标签页' },
+    { key: 'd', ctrl: true, action: toggleTheme, description: '切换主题' },
+  ], [activeTabId, activeTab])
 
-      if (isUndo) {
-        e.preventDefault()
-        undoActive()
-        return
-      }
-      if (isRedo) {
-        e.preventDefault()
-        redoActive()
-        return
-      }
-      if ((e.ctrlKey || e.metaKey) && e.key === 's') {
-        e.preventDefault()
-        saveActiveFile()
-      }
-    }
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [activeTabId, renamingTabId, activeTab?.type, activeTab?.fsPath])
+  useKeyboardShortcuts(shortcuts, { enabled: !renamingTabId })
 
   useEffect(() => {
     const desktop = (window as any).desktop
@@ -747,7 +661,7 @@ function App() {
     e.stopPropagation()
     if (!rootPath) return
     
-    const confirmDelete = confirm(`Are you sure you want to delete ${item.name}?`)
+    const confirmDelete = confirm(`确定要删除 ${item.name} 吗？`)
     if (!confirmDelete) return
 
     try {
@@ -765,7 +679,7 @@ function App() {
       await refreshFileTree()
     } catch (err) {
       console.error('Failed to delete item:', err)
-      alert('Failed to delete. It might be in use or you might not have permission.')
+      alert('删除失败。文件可能正在使用中或没有权限。')
     }
   }
 
@@ -792,77 +706,13 @@ function App() {
     }
   }
 
-  const renderFileTree = (items: FileItem[], depth = 0) => {
-    return items.map(item => {
-      const isExpanded = expandedFolders.has(item.path)
-      const isImage = IMAGE_EXTENSIONS.some(ext => item.name.toLowerCase().endsWith(ext))
-      const isMarkdown = item.name.toLowerCase().endsWith('.md')
-
-      return (
-        <div key={item.path} className="select-none">
-          <div 
-            onClick={(e) => {
-              if (item.kind === 'directory') {
-                toggleFolder(item.path, e)
-                return
-              }
-              openFileFromFs(item.path)
-            }}
-            draggable={item.kind === 'file' && isImage}
-            onDragStart={(e) => {
-              if (item.kind !== 'file' || !isImage) return
-              e.stopPropagation()
-              e.dataTransfer.effectAllowed = 'copy'
-              e.dataTransfer.setData('application/x-mdnb-image-relpath', item.path)
-              e.dataTransfer.setData('text/plain', item.path)
-            }}
-            className={cn(
-              "flex items-center gap-1.5 py-1 px-2 hover:bg-gray-200 cursor-pointer rounded text-sm transition-colors group",
-              activeTabId === item.path ? "bg-white shadow-sm text-blue-600 font-medium" : "text-gray-600"
-            )}
-            style={{ paddingLeft: `${depth * 12 + 8}px` }}
-          >
-            {item.kind === 'directory' ? (
-              <>
-                {isExpanded ? <ChevronDown size={14} className="text-gray-400" /> : <ChevronRight size={14} className="text-gray-400" />}
-                <span className="truncate flex-1">{item.name}</span>
-                <div className="opacity-0 group-hover:opacity-100 flex items-center gap-1 text-gray-400">
-                  <button onClick={(e) => { e.stopPropagation(); createNewFile(item.path) }} title="New File" className="hover:text-blue-500"><FilePlus size={12} /></button>
-                  <button onClick={(e) => { e.stopPropagation(); createNewFolder(item.path) }} title="New Folder" className="hover:text-blue-500"><FolderPlus size={12} /></button>
-                  <button onClick={(e) => { e.stopPropagation(); uploadImage(item.path) }} title="Upload Image" className="hover:text-blue-500"><Upload size={12} /></button>
-                  <button onClick={(e) => deleteItem(item, e)} title="Delete" className="hover:text-red-500"><Trash2 size={12} /></button>
-                </div>
-              </>
-            ) : (
-              <>
-                {isImage ? <ImageIcon size={14} className="text-purple-500" /> : 
-                 isMarkdown ? <FileText size={14} className="text-blue-500" /> : 
-                 <File size={14} className="text-gray-400" />}
-                <span className="truncate flex-1">{item.name}</span>
-                <button 
-                  onClick={(e) => deleteItem(item, e)}
-                  className="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition-all"
-                  title="Delete"
-                >
-                  <Trash2 size={12} />
-                </button>
-              </>
-            )}
-          </div>
-          {item.kind === 'directory' && isExpanded && item.children && (
-            <div>{renderFileTree(item.children, depth + 1)}</div>
-          )}
-        </div>
-      )
-    })
+  const handleDragStartImage = (e: React.DragEvent, path: string) => {
+    e.stopPropagation()
+    e.dataTransfer.effectAllowed = 'copy'
+    e.dataTransfer.setData('application/x-mdnb-image-relpath', path)
+    e.dataTransfer.setData('text/plain', path)
   }
 
-  // ==================== 导出功能 ====================
-  
-  /**
-   * 导出为 PDF
-   * 使用 html2canvas 将预览区域转换为图片，然后生成 PDF
-   */
   const exportPDF = async () => {
     if (!activeTab || activeTab.type !== 'markdown') return
     let restoreView = () => {}
@@ -924,10 +774,6 @@ function App() {
     }
   }
 
-  /**
-   * 导出为 Word
-   * 将预览区域的 HTML 包装为 Word 文档
-   */
   const exportWord = () => {
     if (!activeTab || activeTab.type !== 'markdown') return
     const content = `<html><body>${previewRef.current?.innerHTML || ''}</body></html>`
@@ -935,10 +781,6 @@ function App() {
     saveAs(blob, `${activeTab.name}.doc`)
   }
 
-  /**
-   * Mermaid 图表渲染组件
-   * 用于在 Markdown 中渲染 Mermaid 流程图、时序图等
-   */
   function MermaidDiagram({ chart }: { chart: string }) {
     const idRef = useRef(`m-${Math.random().toString(36).slice(2)}`)
     const containerRef = useRef<HTMLDivElement | null>(null)
@@ -957,6 +799,7 @@ function App() {
           ;(mermaid as any).initialize?.({
             startOnLoad: false,
             securityLevel: 'loose',
+            theme: theme === 'dark' ? 'dark' : 'default',
           })
         } catch {
         }
@@ -985,11 +828,11 @@ function App() {
       return () => {
         cancelled = true
       }
-    }, [chart])
+    }, [chart, theme])
 
     if (!svg) {
       return (
-        <div className="rounded-md border border-gray-200 bg-gray-50 p-3 text-xs text-gray-500">
+        <div className="rounded-md border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 p-3 text-xs text-gray-500 dark:text-gray-400">
           Mermaid 渲染失败
         </div>
       )
@@ -1004,11 +847,6 @@ function App() {
     )
   }
 
-  /**
-   * Markdown 图片解析组件
-   * 用于解析 Markdown 中的图片路径，支持相对路径和外部 URL
-   * 会自动将相对路径转换为 Data URL
-   */
   function ResolvedMarkdownImage(props: any) {
     const src = String(props.src || '')
     const alt = props.alt
@@ -1089,30 +927,83 @@ function App() {
     return <img src={resolvedSrc} alt={alt} title={title} />
   }
 
+  const CodeBlock = useCallback(({ language, children }: { language: string; children: string }) => {
+    const [copied, setCopied] = useState(false)
+
+    const handleCopy = async (e: React.MouseEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
+      try {
+        await navigator.clipboard.writeText(children)
+        setCopied(true)
+        setTimeout(() => setCopied(false), 2000)
+      } catch (err) {
+        console.error('Failed to copy:', err)
+      }
+    }
+
+    return (
+      <div className="relative group">
+        <div className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition-opacity z-10 flex items-center gap-2">
+          {language && (
+            <span className="text-xs text-gray-400 bg-gray-800 px-2 py-0.5 rounded">
+              {language}
+            </span>
+          )}
+          <button
+            onClick={handleCopy}
+            className="p-1.5 rounded bg-gray-700 hover:bg-gray-600 text-gray-300 transition-colors"
+            title="复制代码"
+          >
+            {copied ? <CheckCircle size={14} /> : <FileText size={14} />}
+          </button>
+        </div>
+        <pre className="!bg-gray-900 dark:!bg-gray-950 !text-gray-100 text-sm overflow-x-auto p-4 rounded-lg">
+          <code className={`language-${language || 'text'}`}>{children}</code>
+        </pre>
+      </div>
+    )
+  }, [])
+
   return (
-    <div className="flex h-screen bg-gray-50 text-gray-900 overflow-hidden font-sans">
-        {/* Sidebar - Explorer */}
-        <div className="w-64 bg-gray-100 border-r border-gray-200 flex flex-col shrink-0">
-        <div className="p-4 border-b border-gray-200 bg-gray-100/50 backdrop-blur-sm sticky top-0 z-10">
+    <div className={`flex h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100 overflow-hidden font-sans`}>
+        <div className="w-64 bg-gray-100 dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700 flex flex-col shrink-0">
+        <div className="p-4 border-b border-gray-200 dark:border-gray-700 bg-gray-100/50 dark:bg-gray-800/50 backdrop-blur-sm sticky top-0 z-10">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
-              <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white shadow-lg shadow-blue-200">
+              <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white shadow-lg shadow-blue-200 dark:shadow-blue-900">
                 <FileText size={18} />
               </div>
               <h1 className="font-bold text-lg tracking-tight">Notebook</h1>
             </div>
-            {rootPath && (
-              <div className="flex items-center gap-1 text-gray-400">
-                <button onClick={() => createNewFile()} className="p-1 hover:bg-gray-200 rounded transition-all" title="New File"><FilePlus size={16} /></button>
-                <button onClick={() => createNewFolder()} className="p-1 hover:bg-gray-200 rounded transition-all" title="New Folder"><FolderPlus size={16} /></button>
-                <button onClick={() => uploadImage()} className="p-1 hover:bg-gray-200 rounded transition-all" title="Upload Image"><Upload size={16} /></button>
-              </div>
-            )}
+            <div className="flex items-center gap-1 text-gray-400 dark:text-gray-500">
+              <button 
+                onClick={() => setSearchOpen(true)} 
+                className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-all" 
+                title="搜索文件 (Ctrl+P)"
+              >
+                <Search size={16} />
+              </button>
+              <button 
+                onClick={toggleTheme} 
+                className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-all" 
+                title="切换主题 (Ctrl+D)"
+              >
+                {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+              </button>
+              {rootPath && (
+                <>
+                  <button onClick={() => createNewFile()} className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-all" title="新建文件"><FilePlus size={16} /></button>
+                  <button onClick={() => createNewFolder()} className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-all" title="新建文件夹"><FolderPlus size={16} /></button>
+                  <button onClick={() => uploadImage()} className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-all" title="上传图片"><Upload size={16} /></button>
+                </>
+              )}
+            </div>
           </div>
           {!rootPath && (
             <button 
               onClick={openFolder}
-              className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-white border border-gray-200 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-50 transition-all shadow-sm active:scale-95"
+              className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-lg text-sm font-semibold text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-600 transition-all shadow-sm active:scale-95"
             >
               <FolderOpen size={16} />
               打开文件夹
@@ -1121,21 +1012,31 @@ function App() {
         </div>
         
         <div className="flex-1 overflow-y-auto p-2">
-          <div className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2 px-2 flex justify-between items-center">
+          <div className="text-[11px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-2 px-2 flex justify-between items-center">
             资源管理器
             {rootPath && <span className="text-[10px] lowercase font-normal opacity-60 truncate max-w-[100px]">{rootPath.split(/[\\/]/).filter(Boolean).pop()}</span>}
           </div>
           {fileTree.length > 0 ? (
-            renderFileTree(fileTree)
+            <VirtualizedFileTree
+              items={fileTree}
+              activeTabId={activeTabId}
+              expandedFolders={expandedFolders}
+              onToggleFolder={toggleFolder}
+              onOpenFile={openFileFromFs}
+              onCreateFile={createNewFile}
+              onCreateFolder={createNewFolder}
+              onUploadImage={uploadImage}
+              onDeleteItem={deleteItem}
+              onDragStartImage={handleDragStartImage}
+            />
           ) : (
             <div className="px-4 py-8 text-center">
-              <p className="text-xs text-gray-400">Open a folder to start managing your files.</p>
+              <p className="text-xs text-gray-400 dark:text-gray-500">打开文件夹开始管理您的文件。</p>
             </div>
           )}
         </div>
 
-        {/* Save Status Footer */}
-        <div className="p-3 border-t border-gray-200 bg-gray-100/50 flex items-center justify-between text-[11px] text-gray-500">
+        <div className="p-3 border-t border-gray-200 dark:border-gray-700 bg-gray-100/50 dark:bg-gray-800/50 flex items-center justify-between text-[11px] text-gray-500 dark:text-gray-400">
           <div className="flex items-center gap-1.5">
             {saveStatus === 'saving' && <Clock size={12} className="animate-spin text-blue-500" />}
             {saveStatus === 'saved' && <CheckCircle size={12} className="text-green-500" />}
@@ -1152,10 +1053,8 @@ function App() {
         </div>
       </div>
 
-      {/* Main Content */}
-      <div className="flex-1 flex flex-col min-w-0 bg-white">
-        {/* Tabs Bar */}
-        <div className="h-10 bg-gray-100 border-b border-gray-200 flex items-center justify-between shrink-0">
+      <div className="flex-1 flex flex-col min-w-0 bg-white dark:bg-gray-900">
+        <div className="h-10 bg-gray-100 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between shrink-0">
           <div className="flex items-center overflow-x-auto no-scrollbar flex-1 min-w-0">
             {openTabs.map(tab => (
               <div 
@@ -1163,8 +1062,8 @@ function App() {
                 onClick={() => setActiveTabId(tab.id)}
                 onDoubleClick={() => startRenameTab(tab)}
                 className={cn(
-                  "h-full px-4 flex items-center gap-2 border-r border-gray-200 cursor-pointer text-sm font-medium transition-all group min-w-[120px] max-w-[220px]",
-                  activeTabId === tab.id ? "bg-white text-blue-600 shadow-[inset_0_2px_0_0_#2563eb]" : "text-gray-500 hover:bg-gray-200"
+                  "h-full px-4 flex items-center gap-2 border-r border-gray-200 dark:border-gray-700 cursor-pointer text-sm font-medium transition-all group min-w-[120px] max-w-[220px]",
+                  activeTabId === tab.id ? "bg-white dark:bg-gray-900 text-blue-600 dark:text-blue-400 shadow-[inset_0_2px_0_0_#2563eb]" : "text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"
                 )}
               >
                 {tab.type === 'image' ? <ImageIcon size={14} className="text-purple-500" /> : <FileText size={14} className={tab.isDirty ? "text-orange-400" : "text-blue-500"} />}
@@ -1178,7 +1077,7 @@ function App() {
                       if (e.key === 'Escape') cancelRenameTab()
                     }}
                     autoFocus
-                    className="flex-1 min-w-0 bg-white border border-blue-200 rounded px-2 py-1 text-sm text-gray-800 focus:outline-none"
+                    className="flex-1 min-w-0 bg-white dark:bg-gray-800 border border-blue-200 dark:border-blue-800 rounded px-2 py-1 text-sm text-gray-800 dark:text-gray-200 focus:outline-none"
                     onClick={(e) => e.stopPropagation()}
                   />
                 ) : (
@@ -1187,7 +1086,7 @@ function App() {
                 {tab.isDirty && <div className="w-1.5 h-1.5 rounded-full bg-orange-400 shrink-0" />}
                 <button 
                   onClick={(e) => closeTab(tab.id, e)}
-                  className="opacity-0 group-hover:opacity-100 p-0.5 hover:bg-gray-200 rounded transition-all"
+                  className="opacity-0 group-hover:opacity-100 p-0.5 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-all"
                 >
                   <X size={12} />
                 </button>
@@ -1195,8 +1094,8 @@ function App() {
             ))}
             <button
               onClick={addNewTab}
-              className="h-full px-3 flex items-center justify-center text-gray-500 hover:bg-gray-200 border-r border-gray-200 shrink-0"
-              title="新建标签页"
+              className="h-full px-3 flex items-center justify-center text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 border-r border-gray-200 dark:border-gray-700 shrink-0"
+              title="新建标签页 (Ctrl+N)"
             >
               <FilePlus size={16} />
             </button>
@@ -1207,14 +1106,14 @@ function App() {
               <>
                 <button
                   onClick={() => setViewMode('edit')}
-                  className={cn("p-1.5 rounded-md transition-all", viewMode === 'edit' ? "bg-white shadow-sm text-blue-600" : "text-gray-500 hover:text-gray-700")}
+                  className={cn("p-1.5 rounded-md transition-all", viewMode === 'edit' ? "bg-white dark:bg-gray-700 shadow-sm text-blue-600 dark:text-blue-400" : "text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200")}
                   title="编辑"
                 >
                   <Edit3 size={16} />
                 </button>
                 <button
                   onClick={() => setViewMode('split')}
-                  className={cn("p-1.5 rounded-md transition-all", viewMode === 'split' ? "bg-white shadow-sm text-blue-600" : "text-gray-500 hover:text-gray-700")}
+                  className={cn("p-1.5 rounded-md transition-all", viewMode === 'split' ? "bg-white dark:bg-gray-700 shadow-sm text-blue-600 dark:text-blue-400" : "text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200")}
                   title="分屏"
                 >
                   <div className="flex gap-0.5">
@@ -1224,7 +1123,7 @@ function App() {
                 </button>
                 <button
                   onClick={() => setViewMode('preview')}
-                  className={cn("p-1.5 rounded-md transition-all", viewMode === 'preview' ? "bg-white shadow-sm text-blue-600" : "text-gray-500 hover:text-gray-700")}
+                  className={cn("p-1.5 rounded-md transition-all", viewMode === 'preview' ? "bg-white dark:bg-gray-700 shadow-sm text-blue-600 dark:text-blue-400" : "text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200")}
                   title="预览"
                 >
                   <Eye size={16} />
@@ -1240,26 +1139,27 @@ function App() {
               {activeTab.type === 'markdown' ? (
                 <>
                   {(viewMode === 'edit' || viewMode === 'split') && (
-                    <div className={cn("flex-1 h-full", viewMode === 'split' ? "border-r border-gray-200" : "")}>
+                    <div className={cn("flex-1 h-full", viewMode === 'split' ? "border-r border-gray-200 dark:border-gray-700" : "")}>
                       <textarea 
                         ref={editorRef}
                         value={activeTab.content}
                         onChange={(e) => updateActiveContent(e.target.value)}
                         onDragOver={(e) => e.preventDefault()}
                         onDrop={onDropToEditor}
-                        className="w-full h-full p-8 resize-none focus:outline-none bg-white font-mono text-[14px] leading-relaxed text-gray-800"
-                        placeholder="Start typing markdown..."
+                        className="w-full h-full p-8 resize-none focus:outline-none bg-white dark:bg-gray-900 font-mono text-[14px] leading-relaxed text-gray-800 dark:text-gray-200"
+                        placeholder="开始输入 Markdown..."
                       />
                     </div>
                   )}
                   {(viewMode === 'preview' || viewMode === 'split') && (
-                    <div className="flex-1 h-full overflow-y-auto bg-gray-50/30">
+                    <div className="flex-1 h-full overflow-y-auto bg-gray-50/30 dark:bg-gray-800/30">
                       <div 
                         ref={previewRef}
-                        className="max-w-3xl mx-auto p-12 bg-white min-h-full shadow-sm ring-1 ring-gray-100 my-4 rounded-lg prose prose-slate prose-blue prose-headings:font-bold prose-a:text-blue-600 prose-pre:bg-gray-900 prose-pre:text-gray-100"
+                        className="max-w-3xl mx-auto p-12 bg-white dark:bg-gray-900 min-h-full shadow-sm ring-1 ring-gray-100 dark:ring-gray-700 my-4 rounded-lg prose prose-slate prose-blue dark:prose-invert prose-headings:font-bold prose-a:text-blue-600 dark:prose-a:text-blue-400 prose-pre:bg-gray-900 dark:prose-pre:bg-gray-950 prose-pre:text-gray-100"
                       >
                         <ReactMarkdown
-                          remarkPlugins={[remarkGfm]}
+                          remarkPlugins={[remarkGfm, remarkMath]}
+                          rehypePlugins={[rehypeKatex]}
                           components={{
                             img: (props) => <ResolvedMarkdownImage {...props} />,
                             pre: ({ children }) => {
@@ -1274,17 +1174,28 @@ function App() {
                               }
                               return <pre>{children}</pre>
                             },
+                            code: ({ className, children, ...props }) => {
+                              const match = /language-(\w+)/.exec(className || '')
+                              const language = match ? match[1] : ''
+                              const codeString = String(children).replace(/\n$/, '')
+                              
+                              if (!className) {
+                                return <code className={className} {...props}>{children}</code>
+                              }
+                              
+                              return <CodeBlock language={language}>{codeString}</CodeBlock>
+                            },
                           }}
                         >
-                          {activeTab.content || '*No content yet*'}
+                          {activeTab.content || '*暂无内容*'}
                         </ReactMarkdown>
                       </div>
                     </div>
                   )}
                 </>
               ) : (
-                <div className="flex-1 flex items-center justify-center bg-gray-100/50 p-8 overflow-auto">
-                  <div className="max-w-full max-h-full shadow-2xl rounded-lg overflow-hidden bg-white p-2">
+                <div className="flex-1 flex items-center justify-center bg-gray-100/50 dark:bg-gray-800/50 p-8 overflow-auto">
+                  <div className="max-w-full max-h-full shadow-2xl rounded-lg overflow-hidden bg-white dark:bg-gray-800 p-2">
                     <img src={activeTab.imageUrl} alt={activeTab.name} className="max-w-full max-h-full object-contain" />
                   </div>
                 </div>
@@ -1292,41 +1203,50 @@ function App() {
             </div>
           </>
         ) : (
-          <div className="flex-1 flex items-center justify-center text-gray-300 flex-col gap-6 bg-gray-50/50">
-            <div className="w-24 h-24 bg-white rounded-3xl shadow-xl flex items-center justify-center text-gray-200">
+          <div className="flex-1 flex items-center justify-center text-gray-300 dark:text-gray-600 flex-col gap-6 bg-gray-50/50 dark:bg-gray-900/50">
+            <div className="w-24 h-24 bg-white dark:bg-gray-800 rounded-3xl shadow-xl flex items-center justify-center text-gray-200 dark:text-gray-600">
               <FolderOpen size={48} strokeWidth={1} />
             </div>
             <div className="text-center">
-              <h2 className="text-xl font-bold text-gray-500">Welcome to Notebook</h2>
-              <p className="text-sm text-gray-400 mt-1">Open a folder to start managing and editing your files.</p>
+              <h2 className="text-xl font-bold text-gray-500 dark:text-gray-400">欢迎使用 Notebook</h2>
+              <p className="text-sm text-gray-400 dark:text-gray-500 mt-1">打开文件夹开始管理和编辑您的文件。</p>
             </div>
             <button 
               onClick={openFolder}
-              className="flex items-center gap-2 px-6 py-2.5 bg-blue-600 text-white font-bold rounded-full hover:bg-blue-700 transition-all shadow-lg shadow-blue-200 active:scale-95"
+              className="flex items-center gap-2 px-6 py-2.5 bg-blue-600 text-white font-bold rounded-full hover:bg-blue-700 transition-all shadow-lg shadow-blue-200 dark:shadow-blue-900 active:scale-95"
             >
               <FolderOpen size={18} />
-              Open Folder
+              打开文件夹
             </button>
           </div>
         )}
       </div>
+      
+      {searchOpen && (
+        <FileSearch
+          fileTree={fileTree}
+          onSelectFile={openFileFromFs}
+          onClose={() => setSearchOpen(false)}
+        />
+      )}
+      
       {aboutOpen && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-[100]" onMouseDown={() => setAboutOpen(false)}>
-          <div className="w-full max-w-md bg-white rounded-xl shadow-2xl border border-gray-200 p-6" onMouseDown={(e) => e.stopPropagation()}>
+          <div className="w-full max-w-md bg-white dark:bg-gray-800 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-700 p-6" onMouseDown={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between">
-              <div className="text-lg font-bold text-gray-900">关于</div>
-              <button onClick={() => setAboutOpen(false)} className="p-1 rounded hover:bg-gray-100">
+              <div className="text-lg font-bold text-gray-900 dark:text-gray-100">关于</div>
+              <button onClick={() => setAboutOpen(false)} className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700">
                 <X size={16} />
               </button>
             </div>
-            <div className="mt-3 text-sm text-gray-600 space-y-2">
+            <div className="mt-3 text-sm text-gray-600 dark:text-gray-400 space-y-2">
               <div>软件：Markdown Notebook v1.0</div>
               <div>版本：v1.0</div>
               <div>作者：scold301</div>
               <div>
                 GitHub：
                 <a
-                  className="text-blue-600 hover:underline ml-1"
+                  className="text-blue-600 dark:text-blue-400 hover:underline ml-1"
                   href="https://github.com/scold301/markdown_editor"
                   target="_blank"
                   rel="noreferrer"
@@ -1337,7 +1257,7 @@ function App() {
               <div>说明：本软件用于本地 Markdown/图片文件管理、编辑与导出。</div>
             </div>
             <div className="mt-6 flex justify-end">
-              <button onClick={() => setAboutOpen(false)} className="px-4 py-2 text-sm font-semibold rounded-lg bg-gray-900 text-white hover:bg-gray-800">
+              <button onClick={() => setAboutOpen(false)} className="px-4 py-2 text-sm font-semibold rounded-lg bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-gray-200">
                 确定
               </button>
             </div>

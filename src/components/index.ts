@@ -1,3 +1,6 @@
 export { MermaidDiagram } from './MermaidDiagram'
 export { ResolvedMarkdownImage } from './ResolvedMarkdownImage'
 export { AboutDialog } from './AboutDialog'
+export { default as CodeBlock } from './CodeBlock'
+export { default as FileSearch } from './FileSearch'
+export { default as VirtualizedFileTree } from './VirtualizedFileTree'
